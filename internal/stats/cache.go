@@ -1,24 +1,18 @@
-// Package stats keeps a hot-path, in-memory view of per-account call totals.
-//
-// The durable copy of these numbers lives in Postgres; this cache exists so
-// the stats endpoint does not hit the database on every read.
+// Add in-memory cache for the stats endpoint
 package stats
 
 import "sync"
 
-// AccountStats is a point-in-time view of one account's totals.
 type AccountStats struct {
 	CallCount        int64
 	TotalDurationSec int64
 }
 
-// Cache holds per-account running totals.
 type Cache struct {
 	mu sync.RWMutex
 	m  map[string]*AccountStats
 }
 
-// NewCache returns an empty cache.
 func NewCache() *Cache {
 	return &Cache{m: make(map[string]*AccountStats)}
 }
@@ -35,8 +29,11 @@ func (c *Cache) Get(accountID string) AccountStats {
 	return *s
 }
 
-// Record folds one completed call into an account's running totals.
+// fix(Record): make map updates thread-safe
 func (c *Cache) Record(accountID string, durationSec int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	s, ok := c.m[accountID]
 	if !ok {
 		s = &AccountStats{}
