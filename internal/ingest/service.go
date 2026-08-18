@@ -1,10 +1,11 @@
-// Package ingest accepts call-completion webhooks and processes them.
+// feat(ingest): initialize package
 package ingest
 
 import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -16,12 +17,18 @@ import (
 // recordingWork stands in for downloading and transcoding a recording.
 const recordingWork = 50 * time.Millisecond
 
+// feat: bound background recording time
+const recordingTimeout = 30 * time.Second
+
 // Service ingests webhook deliveries.
 type Service struct {
 	store *store.Store
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+
+	//feat: track background tasks
+	bg sync.WaitGroup
 }
 
 // New builds a Service.
@@ -34,18 +41,8 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 	return s.cache.Get(accountID)
 }
 
-// Ingest stores a delivery and kicks off processing. Processing runs
-// asynchronously so the provider gets a fast acknowledgement.
+// feat: make Ingest idempotent via DB-level deduplication
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -61,22 +58,28 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	inserted, err := s.store.IngestEvent(ctx, rec)
+	if err != nil {
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
+	if !inserted {
+		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		return nil
 	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
+
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
-	// Recordings are slow to fetch, so that part does not block the provider.
+	//perf: fetch recordings asynchronously with a detached context
 	if rec.RecordingURL != "" {
+		s.bg.Add(1)
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
+			defer s.bg.Done()
+			bgCtx, cancel := context.WithTimeout(context.Background(), recordingTimeout)
+			defer cancel()
+			if err := s.processRecording(bgCtx, rec); err != nil {
+				s.log.Error("process recording",
+					"call_id", rec.CallID, "event_id", rec.EventID, "err", err)
 			}
 		}()
 	}
@@ -89,4 +92,19 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
 	time.Sleep(recordingWork)
 	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
+}
+
+// feat: add graceful Shutdown to prevent dropping in-flight work
+func (s *Service) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.bg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

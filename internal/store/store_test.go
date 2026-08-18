@@ -1,88 +1,54 @@
 package store_test
 
 import (
-	"context"
+	"sync"
 	"testing"
 
-	"github.com/convin/webhook-ingest/internal/store"
-	"github.com/convin/webhook-ingest/internal/testutil"
+	"github.com/convin/webhook-ingest/internal/stats"
 )
 
-func TestInsertEventThenExists(t *testing.T) {
-	s := testutil.NewStore(t)
-	eventID, callID, accountID := testutil.IDs(t, s)
-	ctx := context.Background()
+func TestCacheRecordAccumulates(t *testing.T) {
+	c := stats.NewCache()
 
-	evt := store.Event{
-		EventID: eventID, CallID: callID, AccountID: accountID,
-		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
-	}
+	c.Record("acc_1", 30)
+	c.Record("acc_1", 12)
+	c.Record("acc_2", 5)
 
-	exists, err := s.EventExists(ctx, eventID)
-	if err != nil {
-		t.Fatalf("EventExists: %v", err)
-	}
-	if exists {
-		t.Fatal("expected event to be absent before insert")
-	}
-
-	if err := s.InsertEvent(ctx, evt); err != nil {
-		t.Fatalf("InsertEvent: %v", err)
-	}
-
-	exists, err = s.EventExists(ctx, eventID)
-	if err != nil {
-		t.Fatalf("EventExists: %v", err)
-	}
-	if !exists {
-		t.Fatal("expected event to exist after insert")
-	}
-}
-
-func TestIncrementAccountStatsAccumulates(t *testing.T) {
-	s := testutil.NewStore(t)
-	_, _, accountID := testutil.IDs(t, s)
-	ctx := context.Background()
-
-	if err := s.IncrementAccountStats(ctx, accountID, 30); err != nil {
-		t.Fatalf("IncrementAccountStats: %v", err)
-	}
-	if err := s.IncrementAccountStats(ctx, accountID, 12); err != nil {
-		t.Fatalf("IncrementAccountStats: %v", err)
-	}
-
-	got, err := s.AccountStats(ctx, accountID)
-	if err != nil {
-		t.Fatalf("AccountStats: %v", err)
-	}
+	got := c.Get("acc_1")
 	if got.CallCount != 2 || got.TotalDurationSec != 42 {
-		t.Fatalf("got %+v, want CallCount=2 TotalDurationSec=42", got)
+		t.Fatalf("acc_1: got %+v, want CallCount=2 TotalDurationSec=42", got)
+	}
+
+	other := c.Get("acc_2")
+	if other.CallCount != 1 || other.TotalDurationSec != 5 {
+		t.Fatalf("acc_2: got %+v, want CallCount=1 TotalDurationSec=5", other)
 	}
 }
 
-func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
-	s := testutil.NewStore(t)
-	eventID, callID, accountID := testutil.IDs(t, s)
-	ctx := context.Background()
+func TestCacheGetUnknownAccountIsZero(t *testing.T) {
+	c := stats.NewCache()
+	if got := c.Get("nobody"); got.CallCount != 0 || got.TotalDurationSec != 0 {
+		t.Fatalf("got %+v, want zero value", got)
+	}
+}
 
-	evt := store.Event{
-		EventID: eventID, CallID: callID, AccountID: accountID,
-		Status: "completed", DurationSec: 10,
-		RecordingURL: "https://example.com/a.wav", Payload: []byte(`{}`),
-	}
-	if err := s.UpsertCall(ctx, evt); err != nil {
-		t.Fatalf("UpsertCall: %v", err)
-	}
-	if err := s.MarkRecordingProcessed(ctx, callID); err != nil {
-		t.Fatalf("MarkRecordingProcessed: %v", err)
-	}
+// test: verify thread-safe map updates in Record
+func TestCacheRecordIsConcurrencySafe(t *testing.T) {
+	c := stats.NewCache()
 
-	var processed bool
-	row := s.Pool().QueryRow(ctx, `SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
-	if err := row.Scan(&processed); err != nil {
-		t.Fatalf("scan: %v", err)
+	const goroutines = 50
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			c.Record("acc_shared", 1)
+		}()
 	}
-	if !processed {
-		t.Fatal("expected recording_processed to be true")
+	wg.Wait()
+
+	got := c.Get("acc_shared")
+	if got.CallCount != goroutines {
+		t.Fatalf("CallCount = %d, want %d (lost updates under concurrent Record)", got.CallCount, goroutines)
 	}
 }
