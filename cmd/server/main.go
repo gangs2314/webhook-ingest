@@ -57,7 +57,13 @@ func main() {
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Error("shutdown", "err", err)
+		log.Error("http shutdown", "err", err)
+	}
+
+	//fix: drain background work on deploy
+	if err := svc.Shutdown(shutdownCtx); err != nil {
+		log.Error("in-flight recording work did not finish before shutdown deadline", "err", err)
 	}
 }
